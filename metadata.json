@@ -1,0 +1,11 @@
+{
+  "name": "Guru Live Translator",
+  "description": "Two-person Malayalam ↔ English real-time faithful translation and interpretation application with text, voice, and live speech modes.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

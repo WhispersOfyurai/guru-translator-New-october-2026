@@ -1,0 +1,26 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Chat rooms
+    match /rooms/{roomId} {
+      allow read: if roomId is string && roomId.size() >= 2 && roomId.size() <= 64;
+      allow create, update: if roomId is string && roomId.size() >= 2 && roomId.size() <= 64
+        && request.resource.data.roomId == roomId;
+
+      // Messages inside a specific room
+      match /messages/{messageId} {
+        allow read: if roomId is string && roomId.size() >= 2 && roomId.size() <= 64;
+        allow create: if roomId is string && roomId.size() >= 2 && roomId.size() <= 64
+          && request.resource.data.roomId == roomId
+          && request.resource.data.messageId == messageId
+          && request.resource.data.originalText is string
+          && request.resource.data.translatedText is string;
+      }
+    }
+  }
+}

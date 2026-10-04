@@ -1,0 +1,118 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "A live translation room",
+      "type": "object",
+      "properties": {
+        "roomId": {
+          "type": "string",
+          "description": "Unique room identifier",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Creation timestamp in milliseconds"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Last updated timestamp in milliseconds"
+        }
+      },
+      "required": ["roomId", "createdAt", "updatedAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A translated chat message inside a room",
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "description": "Unique message identifier",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "roomId": {
+          "type": "string",
+          "description": "Room identifier",
+          "minLength": 2,
+          "maxLength": 64
+        },
+        "senderId": {
+          "type": "string",
+          "description": "Identifier of the participant who sent the message",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Display name of the sender",
+          "maxLength": 128
+        },
+        "senderRole": {
+          "type": "string",
+          "description": "Role of the sender",
+          "enum": ["malayalam_speaker", "english_speaker", "observer"]
+        },
+        "sourceLanguage": {
+          "type": "string",
+          "description": "Original language code",
+          "enum": ["ml", "en", "auto"]
+        },
+        "originalText": {
+          "type": "string",
+          "description": "Original text entered by speaker",
+          "maxLength": 10000
+        },
+        "transliteration": {
+          "type": "string",
+          "description": "Roman script transliteration for Malayalam",
+          "maxLength": 10000
+        },
+        "translatedText": {
+          "type": "string",
+          "description": "Faithful translation of the original text",
+          "maxLength": 10000
+        },
+        "targetLanguage": {
+          "type": "string",
+          "description": "Target translated language code",
+          "enum": ["ml", "en"]
+        },
+        "messageType": {
+          "type": "string",
+          "description": "Type of message delivery",
+          "enum": ["text", "voice", "live"]
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Timestamp when message was created"
+        }
+      },
+      "required": [
+        "messageId",
+        "senderId",
+        "senderName",
+        "senderRole",
+        "sourceLanguage",
+        "originalText",
+        "translatedText",
+        "targetLanguage",
+        "messageType",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": "Room",
+      "description": "Chat rooms collection"
+    },
+    "/rooms/{roomId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Collection of messages belonging to a specific room"
+    }
+  }
+}
