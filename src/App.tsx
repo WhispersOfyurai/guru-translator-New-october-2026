@@ -20,7 +20,14 @@ import {
   Share2,
   Clock,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Activity,
+  CheckCircle2,
+  Trash2,
+  Edit3,
+  Info,
+  X,
+  Square
 } from 'lucide-react';
 import type { ChatMessage, RoomState, UserRole, TranslationResult } from './types';
 
@@ -134,12 +141,49 @@ export default function App() {
   // Live Simultaneous Interpreter State
   const [isLiveActive, setIsLiveActive] = useState<boolean>(false);
 
+  // Review-Before-Translation Dictation State
+  const [draftTranscript, setDraftTranscript] = useState<string>('');
+  const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
+  const [dictationLang, setDictationLang] = useState<'ml' | 'en'>(() => (userRole === 'english_speaker' ? 'en' : 'ml'));
+  const [draftSourceLang, setDraftSourceLang] = useState<'ml' | 'en'>('ml');
+  const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
+  const [transcriptionMetrics, setTranscriptionMetrics] = useState<{
+    recordingDurationSec: number;
+    stopToUploadMs: number;
+    uploadAndServerMs: number;
+    geminiProcessingMs: number;
+    totalLatencyMs: number;
+    modelUsed: string;
+  } | null>(null);
+
+  // Microphone Diagnostic State (Android Google Meet test)
+  const [showMicDiagnostic, setShowMicDiagnostic] = useState<boolean>(false);
+  const [micPermissionStatus, setMicPermissionStatus] = useState<'prompt' | 'granted' | 'denied' | 'checking'>('prompt');
+  const [diagnosticAudioLevel, setDiagnosticAudioLevel] = useState<number>(0);
+  const [isTestingMic, setIsTestingMic] = useState<boolean>(false);
+  const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
+
+  // Text Mode Dictation State
+  const [textDictationLang, setTextDictationLang] = useState<'ml' | 'en'>(() => (userRole === 'english_speaker' ? 'en' : 'ml'));
+  const [recordingTarget, setRecordingTarget] = useState<'text' | 'voice' | null>(null);
+  const [isStartingRecording, setIsStartingRecording] = useState<boolean>(false);
+
   // Refs
+  const recordingTargetRef = useRef<'text' | 'voice' | null>(null);
+  const isCancelledRef = useRef<boolean>(false);
+  const isStartingRecordingRef = useRef<boolean>(false);
+  const isRecordingRef = useRef<boolean>(false);
+  const stopRequestedRef = useRef<boolean>(false);
+  const recordedMimeTypeRef = useRef<string>('audio/webm');
+  const textInputRef = useRef<HTMLInputElement | null>(null);
+  const cursorPositionRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<any>(null);
+  const recordingStartTimeRef = useRef<number | null>(null);
+  const stopPressedTimeRef = useRef<number | null>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const joinedRef = useRef<boolean>(false);
   joinedRef.current = joined;
@@ -148,6 +192,12 @@ export default function App() {
   const heartbeatIntervalRef = useRef<any>(null);
   const reconnectTimeoutRef = useRef<any>(null);
   const reconnectAttemptsRef = useRef<number>(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const diagnosticStreamRef = useRef<MediaStream | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const liveAudioMeterFrameRef = useRef<number | null>(null);
 
   // Helper to extract clean room ID from URL
   const extractRoomIdFromUrl = (): string | null => {
@@ -522,6 +572,7 @@ export default function App() {
 
   const handleLeave = () => {
     stopHeartbeat();
+    stopMicDiagnostic();
     if (wsRef.current) {
       try {
         wsRef.current.close();
@@ -537,6 +588,7 @@ export default function App() {
     setJoined(false);
     setConnectionStatus('disconnected');
     setMessages([]);
+    setDraftTranscript('');
     window.history.pushState({}, '', `/`);
   };
 
@@ -546,7 +598,8 @@ export default function App() {
     if (!inputText.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
     const t1 = Date.now();
-    const sourceLang = userRole === 'malayalam_speaker' ? 'ml' : userRole === 'english_speaker' ? 'en' : 'auto';
+    const hasMalayalamScript = /[\u0D00-\u0D7F]/.test(inputText);
+    const sourceLang = hasMalayalamScript ? 'ml' : userRole === 'malayalam_speaker' ? 'ml' : 'en';
     setIsTranslating(true);
     setErrorMessage(null);
 
@@ -559,8 +612,8 @@ export default function App() {
         payload: {
           roomId,
           senderId: userId,
-          senderName: userName || (userRole === 'malayalam_speaker' ? 'Malayalam Speaker' : 'English Speaker'),
-          senderRole: userRole,
+          senderName: userName || (sourceLang === 'ml' ? 'Malayalam Speaker' : 'English Speaker'),
+          senderRole: sourceLang === 'ml' ? 'malayalam_speaker' : 'english_speaker',
           text: inputText.trim(),
           sourceLang,
           messageType: 'text',
@@ -575,102 +628,480 @@ export default function App() {
     setInputText('');
   };
 
-  // Push-to-Talk Voice Recording
-  const startRecording = async () => {
-    setErrorMessage(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioChunksRef.current = [];
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
+  // =========================================================================
+  // REVIEW-BEFORE-TRANSLATION DICTATION PIPELINE
+  // =========================================================================
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
+  // Audio MIME type detector
+  const getSupportedAudioMimeType = (): string => {
+    if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') {
+      return 'audio/webm';
+    }
+    const candidateTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4',
+      'audio/aac',
+    ];
+    for (const type of candidateTypes) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return '';
+  };
+
+  // Start microphone recording with live audio level analysis
+  const startRecording = async (targetOrEvent?: 'text' | 'voice' | React.SyntheticEvent) => {
+    // Prevent overlapping startup calls
+    if (isStartingRecordingRef.current || isRecordingRef.current) {
+      console.warn('[Microphone] Recording already starting or active. Ignoring duplicate invocation.');
+      return;
+    }
+
+    const target: 'text' | 'voice' = targetOrEvent === 'text' ? 'text' : 'voice';
+    setErrorMessage(null);
+    isCancelledRef.current = false;
+    stopRequestedRef.current = false;
+    isStartingRecordingRef.current = true;
+    setIsStartingRecording(true);
+    setRecordingTarget(target);
+    recordingTargetRef.current = target;
+
+    if (target === 'voice') {
+      setDraftTranscript('');
+      setTranscriptionMetrics(null);
+    } else if (target === 'text') {
+      if (textInputRef.current) {
+        cursorPositionRef.current = textInputRef.current.selectionStart;
+      }
+    }
+
+    // Clean up any previously dangling stream or audio context
+    if (recordingStreamRef.current) {
+      try {
+        recordingStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (_) {}
+      recordingStreamRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      try {
+        audioContextRef.current.close().catch(() => {});
+      } catch (_) {}
+      audioContextRef.current = null;
+    }
+
+    try {
+      // 1. Request microphone permission and stream
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // If user released or clicked stop while mic was initializing, exit cleanly
+      if (stopRequestedRef.current || isCancelledRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        isStartingRecordingRef.current = false;
+        setIsStartingRecording(false);
+        setRecordingTarget(null);
+        recordingTargetRef.current = null;
+        stopRequestedRef.current = false;
+        return;
+      }
+
+      recordingStreamRef.current = stream;
+      audioChunksRef.current = [];
+      recordingStartTimeRef.current = Date.now();
+      stopPressedTimeRef.current = null;
+
+      // 2. Set up audio level meter with safety
+      try {
+        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtxClass) {
+          const audioCtx = new AudioCtxClass();
+          audioContextRef.current = audioCtx;
+          if (audioCtx.state === 'suspended') {
+            audioCtx.resume().catch(() => {});
+          }
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256;
+          analyserRef.current = analyser;
+          const source = audioCtx.createMediaStreamSource(stream);
+          source.connect(analyser);
+
+          const dataArr = new Uint8Array(analyser.frequencyBinCount);
+          const updateRecordingMeter = () => {
+            if (!analyserRef.current) return;
+            analyserRef.current.getByteFrequencyData(dataArr);
+            let sum = 0;
+            for (let i = 0; i < dataArr.length; i++) sum += dataArr[i];
+            const avg = sum / dataArr.length;
+            const level = Math.min(100, Math.round((avg / 128) * 100));
+            setMicAudioLevel(level);
+            liveAudioMeterFrameRef.current = requestAnimationFrame(updateRecordingMeter);
+          };
+          updateRecordingMeter();
+        }
+      } catch (audioErr) {
+        console.warn('AudioContext level monitor unavailable:', audioErr);
+      }
+
+      // 3. Create MediaRecorder with supported mimeType
+      const mimeType = getSupportedAudioMimeType();
+      const options: MediaRecorderOptions = {};
+      if (mimeType) {
+        options.mimeType = mimeType;
+      }
+      const mediaRecorder = new MediaRecorder(stream, options);
+      mediaRecorderRef.current = mediaRecorder;
+      const actualMimeType = mediaRecorder.mimeType || mimeType || 'audio/webm';
+      recordedMimeTypeRef.current = actualMimeType;
+
+      mediaRecorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data && event.data.size > 0) {
           audioChunksRef.current.push(event.data);
         }
       };
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        stream.getTracks().forEach((track) => track.stop());
+        isRecordingRef.current = false;
+        setIsRecording(false);
 
-        if (audioBlob.size < 800) {
-          setErrorMessage('Audio recording was too short. Please speak clearly.');
+        // If recording was explicitly cancelled, discard and exit immediately
+        if (isCancelledRef.current) {
+          isCancelledRef.current = false;
+          setRecordingTarget(null);
+          recordingTargetRef.current = null;
+          setIsTranscribing(false);
+          setMicAudioLevel(0);
+          if (recordingStreamRef.current) {
+            recordingStreamRef.current.getTracks().forEach((track) => track.stop());
+            recordingStreamRef.current = null;
+          }
           return;
         }
 
-        // Convert blob to base64 and send to transcription API
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          const base64Audio = reader.result as string;
-          setIsTranslating(true);
+        const currentTarget = recordingTargetRef.current || 'voice';
+        const tUploadStart = Date.now();
+        const tStopPressed = stopPressedTimeRef.current || tUploadStart;
+        const stopToUploadMs = Math.max(0, tUploadStart - tStopPressed);
+        const tRecordStart = recordingStartTimeRef.current || tStopPressed;
+        const recordingDurationSec = Number((Math.max(0, tStopPressed - tRecordStart) / 1000).toFixed(1));
 
-          try {
-            const preferredLang = userRole === 'malayalam_speaker' ? 'ml' : 'en';
-            const transcribeRes = await fetch('/api/transcribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                audioBase64: base64Audio,
-                language: preferredLang,
-              }),
-            });
+        // Stop audio level monitor
+        if (liveAudioMeterFrameRef.current) {
+          cancelAnimationFrame(liveAudioMeterFrameRef.current);
+          liveAudioMeterFrameRef.current = null;
+        }
+        setMicAudioLevel(0);
 
-            if (!transcribeRes.ok) {
-              const errData = await transcribeRes.json();
-              throw new Error(errData.error || 'Transcription failed');
-            }
+        if (recordingStreamRef.current) {
+          recordingStreamRef.current.getTracks().forEach((track) => track.stop());
+          recordingStreamRef.current = null;
+        }
 
-            const data = await transcribeRes.json();
-            const transcribedText = data.text?.trim();
+        const audioBlob = new Blob(audioChunksRef.current, { type: recordedMimeTypeRef.current });
 
-            if (transcribedText && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-              wsRef.current.send(
-                JSON.stringify({
-                  type: 'SEND_MESSAGE',
-                  payload: {
-                    roomId,
-                    senderId: userId,
-                    senderName: userName || (userRole === 'malayalam_speaker' ? 'Malayalam Speaker' : 'English Speaker'),
-                    senderRole: userRole,
-                    text: transcribedText,
-                    sourceLang: preferredLang,
-                    messageType: 'voice',
-                  },
-                })
-              );
-            } else {
-              setIsTranslating(false);
-              setErrorMessage('No speech detected. Please speak closer to the microphone.');
-            }
-          } catch (err: any) {
-            setIsTranslating(false);
-            setErrorMessage(err.message || 'Voice translation failed');
+        // Validate that audio chunks exist and blob contains usable audio
+        if (!audioBlob || audioBlob.size < 200 || audioChunksRef.current.length === 0) {
+          console.warn(`[Microphone] Audio blob too small or empty (${audioBlob?.size || 0} bytes, ${audioChunksRef.current.length} chunks)`);
+          setIsTranscribing(false);
+          setRecordingTarget(null);
+          recordingTargetRef.current = null;
+          setErrorMessage('Audio recording was too short or silent. Please hold mic closer and speak clearly.');
+          return;
+        }
+
+        try {
+          const speechInputLang = currentTarget === 'text' ? textDictationLang : dictationLang;
+          // Direct binary stream upload: cuts client base64 overhead and reduces payload by ~33%
+          const transcribeRes = await fetch(`/api/transcribe?language=${speechInputLang}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': audioBlob.type || recordedMimeTypeRef.current || 'audio/webm',
+              'x-language': speechInputLang,
+            },
+            body: audioBlob,
+          });
+
+          const tResponseReceived = Date.now();
+          const uploadAndServerMs = tResponseReceived - tUploadStart;
+
+          if (!transcribeRes.ok) {
+            const errData = await transcribeRes.json().catch(() => ({}));
+            throw new Error(errData.error || `Audio transcription failed (HTTP ${transcribeRes.status})`);
           }
-        };
-        reader.readAsDataURL(audioBlob);
+
+          const data = await transcribeRes.json();
+          const transcribedText = (data.text || '').trim();
+          const totalLatencyMs = Date.now() - tStopPressed;
+
+          setIsTranscribing(false);
+          setRecordingTarget(null);
+          recordingTargetRef.current = null;
+
+          if (transcribedText) {
+            if (currentTarget === 'text') {
+              // Insert dictated speech into Text Mode input without overwriting existing text
+              setInputText((prev) => {
+                if (!prev.trim()) return transcribedText;
+                const pos = cursorPositionRef.current;
+                if (pos !== null && pos >= 0 && pos <= prev.length) {
+                  const before = prev.slice(0, pos).trimEnd();
+                  const after = prev.slice(pos).trimStart();
+                  return [before, transcribedText, after].filter(Boolean).join(' ');
+                }
+                return `${prev.trim()} ${transcribedText}`;
+              });
+              setErrorMessage(null);
+              // Focus text input for convenient user editing
+              setTimeout(() => {
+                textInputRef.current?.focus();
+              }, 60);
+            } else {
+              // Push-to-Talk voice mode: populate draft transcript for user review and correction
+              setTranscriptionMetrics({
+                recordingDurationSec,
+                stopToUploadMs,
+                uploadAndServerMs,
+                geminiProcessingMs: data.timings?.geminiDurationMs || data.geminiDurationMs || uploadAndServerMs,
+                totalLatencyMs,
+                modelUsed: data.modelUsed || data.timings?.modelUsed || 'gemini-3.5-transcribe',
+              });
+              setDraftTranscript(transcribedText);
+              setDraftSourceLang(speechInputLang);
+              setErrorMessage(null);
+            }
+          } else {
+            setErrorMessage(
+              `No speech detected in ${speechInputLang === 'ml' ? 'Malayalam' : 'English'}. Please hold mic closer and speak clearly.`
+            );
+          }
+        } catch (err: any) {
+          setIsTranscribing(false);
+          setRecordingTarget(null);
+          recordingTargetRef.current = null;
+          setErrorMessage(err.message || 'Voice transcription failed');
+        }
       };
 
-      mediaRecorder.start();
+      // 4. Start recording with a 250ms timeslice to ensure continuous chunk gathering
+      mediaRecorder.start(250);
+      isRecordingRef.current = true;
       setIsRecording(true);
+      isStartingRecordingRef.current = false;
+      setIsStartingRecording(false);
       setRecordingDuration(0);
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
       recordingTimerRef.current = setInterval(() => {
         setRecordingDuration((prev) => prev + 1);
       }, 1000);
     } catch (err: any) {
+      isStartingRecordingRef.current = false;
+      setIsStartingRecording(false);
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      setRecordingTarget(null);
+      recordingTargetRef.current = null;
       console.error('Microphone access denied:', err);
-      setErrorMessage('Microphone access required. Please grant permission in your browser.');
+      const isAndroidConflict =
+        err?.name === 'TrackStartError' ||
+        err?.name === 'NotReadableError' ||
+        err?.message?.includes('concurrent') ||
+        err?.message?.includes('in use');
+      setErrorMessage(
+        isAndroidConflict
+          ? 'Microphone is currently held in exclusive communication mode by the Google Meet app on this phone. Note: Android OS may block simultaneous microphone capture while a call is active in another app. (You do not need to mute/unmute Google Meet; if your phone blocks simultaneous access, use Text Mode or place a second device nearby).'
+          : err?.name === 'NotAllowedError'
+          ? 'Microphone permission denied. Tap the lock/tune icon in the Chrome URL bar, select Permissions, and allow Microphone access.'
+          : err?.name === 'AbortError'
+          ? 'Audio recording was interrupted. Please tap Start Recording again.'
+          : 'Microphone access could not be established. Please check browser permissions.'
+      );
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+    // If user clicked stop while getUserMedia was still awaiting permission/hardware:
+    if (isStartingRecordingRef.current) {
+      stopRequestedRef.current = true;
+      setIsStartingRecording(false);
+      return;
+    }
+
+    if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
+      stopPressedTimeRef.current = Date.now();
+      setIsTranscribing(true);
+      try {
+        // Request any pending data to flush into ondataavailable before stopping
+        if (mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.requestData();
+        }
+      } catch (_) {}
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {
+        console.warn('MediaRecorder stop error:', e);
+      }
+      isRecordingRef.current = false;
       setIsRecording(false);
       if (recordingTimerRef.current) {
         clearInterval(recordingTimerRef.current);
       }
     }
+  };
+
+  const cancelRecording = () => {
+    isCancelledRef.current = true;
+    stopRequestedRef.current = true;
+    isStartingRecordingRef.current = false;
+    setIsStartingRecording(false);
+    isRecordingRef.current = false;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {
+        // ignore
+      }
+    }
+    if (recordingStreamRef.current) {
+      recordingStreamRef.current.getTracks().forEach((track) => track.stop());
+      recordingStreamRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      try {
+        audioContextRef.current.close().catch(() => {});
+      } catch (_) {}
+      audioContextRef.current = null;
+    }
+    if (liveAudioMeterFrameRef.current) {
+      cancelAnimationFrame(liveAudioMeterFrameRef.current);
+      liveAudioMeterFrameRef.current = null;
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+    }
+    setIsRecording(false);
+    setRecordingTarget(null);
+    recordingTargetRef.current = null;
+    setIsTranscribing(false);
+    setMicAudioLevel(0);
+  };
+
+  // Submit approved, corrected transcript through the faithful translation pipeline
+  const handleApproveAndTranslate = () => {
+    if (!draftTranscript.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    const t1 = Date.now();
+    const sourceLang = draftSourceLang;
+    setIsTranslating(true);
+    setErrorMessage(null);
+
+    const t2 = Date.now();
+    wsRef.current.send(
+      JSON.stringify({
+        type: 'SEND_MESSAGE',
+        payload: {
+          roomId,
+          senderId: userId,
+          senderName: userName || (sourceLang === 'ml' ? 'Malayalam Speaker' : 'English Speaker'),
+          senderRole: sourceLang === 'ml' ? 'malayalam_speaker' : 'english_speaker',
+          text: draftTranscript.trim(),
+          sourceLang,
+          messageType: 'voice',
+          clientTimings: {
+            t1_userPressSend: t1,
+            t2_requestLeavesBrowser: t2,
+          },
+        },
+      })
+    );
+
+    // Clear draft transcript once dispatched
+    setDraftTranscript('');
+    setTranscriptionMetrics(null);
+  };
+
+  const handleDiscardDraft = () => {
+    setDraftTranscript('');
+    setTranscriptionMetrics(null);
+    setErrorMessage(null);
+  };
+
+  // =========================================================================
+  // MICROPHONE & GOOGLE MEET ACOUSTIC DIAGNOSTIC
+  // =========================================================================
+
+  const runMicDiagnostic = async () => {
+    setDiagnosticError(null);
+    setIsTestingMic(true);
+
+    try {
+      // 1. Check browser permission query if supported
+      if (navigator.permissions && navigator.permissions.query) {
+        try {
+          const status = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+          setMicPermissionStatus(status.state as any);
+          status.onchange = () => setMicPermissionStatus(status.state as any);
+        } catch (_) {}
+      }
+
+      // 2. Request microphone stream
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      diagnosticStreamRef.current = stream;
+      setMicPermissionStatus('granted');
+
+      // 3. Connect Web Audio Analyser
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = audioCtx;
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyserRef.current = analyser;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const checkAudioLevel = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const avg = sum / dataArray.length;
+        const level = Math.min(100, Math.round((avg / 128) * 100));
+        setDiagnosticAudioLevel(level);
+        animationFrameRef.current = requestAnimationFrame(checkAudioLevel);
+      };
+      checkAudioLevel();
+    } catch (err: any) {
+      console.error('Microphone diagnostic error:', err);
+      setMicPermissionStatus('denied');
+      setDiagnosticError(
+        err?.name === 'NotAllowedError'
+          ? 'Microphone permission denied by Android/Browser. Please tap the lock icon in the Chrome URL bar and allow Microphone.'
+          : err?.name === 'TrackStartError'
+          ? 'Microphone hardware is locked by Google Meet (Call in progress). Android restricts concurrent microphone access while Meet holds the communication channel.'
+          : err?.message || 'Failed to access microphone'
+      );
+      setIsTestingMic(false);
+    }
+  };
+
+  const stopMicDiagnostic = () => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (diagnosticStreamRef.current) {
+      diagnosticStreamRef.current.getTracks().forEach((t) => t.stop());
+      diagnosticStreamRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    setIsTestingMic(false);
+    setDiagnosticAudioLevel(0);
   };
 
   // Play Message Audio via Server TTS or Web Speech Synthesis
@@ -1344,84 +1775,553 @@ export default function App() {
       {/* Bottom Control Dock */}
       <footer className="bg-slate-900 border-t border-slate-800 p-3 sm:p-4 sticky bottom-0 z-20">
         <div className="max-w-4xl mx-auto">
-          {/* MODE 1: TEXT TRANSLATION */}
+          {/* MODE 1: TEXT TRANSLATION WITH INLINE DICTATION */}
           {mode === 'text' && (
             <div className="space-y-2">
-              {/* Quick spiritual terminology suggestions */}
-              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px] text-slate-400 scrollbar-none">
-                <span className="shrink-0 text-slate-500 font-medium">Quick terms:</span>
-                {(userRole === 'malayalam_speaker'
-                  ? ['ഗുരുദേവ്', 'സാധന', 'ഗുരുത്വം', 'ദീക്ഷ', 'ആത്മാവ്', 'മോക്ഷം']
-                  : ['Gurudev', 'Sadhana', 'Guruthva', 'Diksha', 'Atma', 'Moksha']
-                ).map((term) => (
+              {/* Header Bar: Speech Language Toggle & Quick Spiritual Terms */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-0.5">
+                {/* Dictation Language Selector Pill */}
+                <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-[11px] shrink-0">
+                  <Languages className="w-3.5 h-3.5 text-amber-400 ml-1 shrink-0" />
+                  <span className="text-slate-400 text-[11px] px-1 hidden sm:inline font-medium">Dictate:</span>
                   <button
-                    key={term}
                     type="button"
-                    onClick={() => setInputText((prev) => (prev ? `${prev} ${term}` : term))}
-                    className="shrink-0 px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-amber-300/90 border border-slate-700/80 transition-all font-mono"
+                    onClick={() => setTextDictationLang('ml')}
+                    disabled={isRecording || isTranscribing}
+                    className={`px-2 py-0.5 rounded-lg transition-all text-[11px] font-semibold cursor-pointer ${
+                      textDictationLang === 'ml'
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Dictate in Malayalam (transcribes verbatim into Malayalam script)"
                   >
-                    +{term}
+                    മലയാളം (ML)
                   </button>
-                ))}
+                  <button
+                    type="button"
+                    onClick={() => setTextDictationLang('en')}
+                    disabled={isRecording || isTranscribing}
+                    className={`px-2 py-0.5 rounded-lg transition-all text-[11px] font-semibold cursor-pointer ${
+                      textDictationLang === 'en'
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Dictate in English (transcribes verbatim into English text)"
+                  >
+                    English (EN)
+                  </button>
+                </div>
+
+                {/* Quick spiritual terminology suggestions */}
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 text-[11px] text-slate-400 scrollbar-none">
+                  <span className="shrink-0 text-slate-500 font-medium hidden md:inline">Terms:</span>
+                  {(textDictationLang === 'ml' || userRole === 'malayalam_speaker'
+                    ? ['ഗുരുദേവ്', 'സാധന', 'ഗുരുത്വം', 'ദീക്ഷ', 'ആത്മാവ്', 'മോക്ഷം']
+                    : ['Gurudev', 'Sadhana', 'Guruthva', 'Diksha', 'Atma', 'Moksha']
+                  ).map((term) => (
+                    <button
+                      key={term}
+                      type="button"
+                      onClick={() =>
+                        setInputText((prev) => (prev ? `${prev} ${term}` : term))
+                      }
+                      className="shrink-0 px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-amber-300/90 border border-slate-700/80 transition-all font-mono cursor-pointer"
+                    >
+                      +{term}
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              <form onSubmit={handleSendMessage} className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  placeholder={
-                    userRole === 'malayalam_speaker'
-                      ? 'മലയാളത്തിൽ ടൈപ്പ് ചെയ്യുക (Type in Malayalam)...'
-                      : 'Type faithful message in English...'
-                  }
-                  className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm sm:text-base text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500"
-                />
-                <button
-                  type="submit"
-                  disabled={!inputText.trim() || isTranslating}
-                  className="bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-bold p-3 sm:px-5 sm:py-3 rounded-xl transition-all flex items-center gap-2 shadow-lg"
-                >
-                  <Send className="w-5 h-5" />
-                  <span className="hidden sm:inline">Send</span>
-                </button>
-              </form>
+              {/* ACTIVE TEXT MODE RECORDING STATE */}
+              {isRecording && recordingTarget === 'text' ? (
+                <div className="flex items-center gap-2 bg-slate-950 border-2 border-red-500/70 rounded-xl p-2.5 shadow-xl animate-in fade-in duration-150">
+                  {/* Pulsing red dot & duration */}
+                  <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold text-red-400 shrink-0 pl-1">
+                    <span className="relative flex h-3 w-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                    </span>
+                    <span>
+                      Dictating {textDictationLang === 'ml' ? 'Malayalam' : 'English'} ({recordingDuration}s)
+                    </span>
+                  </div>
+
+                  {/* Audio level meter */}
+                  <div className="flex-1 hidden xs:flex items-center h-2 bg-slate-800 rounded-full overflow-hidden mx-2">
+                    <div
+                      className={`h-full transition-all duration-75 ${
+                        micAudioLevel > 35
+                          ? 'bg-emerald-400'
+                          : micAudioLevel > 15
+                          ? 'bg-amber-400'
+                          : 'bg-slate-600'
+                      }`}
+                      style={{ width: `${Math.max(8, micAudioLevel)}%` }}
+                    />
+                  </div>
+
+                  {/* Recording Actions: Cancel vs Done */}
+                  <div className="flex items-center gap-1.5 ml-auto shrink-0">
+                    <button
+                      type="button"
+                      onClick={cancelRecording}
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1 border border-slate-700 transition-all cursor-pointer"
+                      title="Cancel dictation (preserves previously typed text)"
+                    >
+                      <X className="w-3.5 h-3.5 text-slate-400" />
+                      <span className="hidden sm:inline">Cancel</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={stopRecording}
+                      className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-slate-950 text-xs font-bold flex items-center gap-1.5 shadow transition-all active:scale-95 cursor-pointer"
+                      title="Done speaking: stop and insert verbatim transcript"
+                    >
+                      <Check className="w-4 h-4 text-slate-950" />
+                      <span>Done</span>
+                    </button>
+                  </div>
+                </div>
+              ) : isTranscribing && recordingTarget === 'text' ? (
+                /* TRANSCRIBING STATE FOR TEXT MODE */
+                <div className="flex items-center justify-between gap-2 bg-slate-950 border border-amber-500/50 rounded-xl px-4 py-3 text-xs sm:text-sm text-amber-300 shadow">
+                  <div className="flex items-center gap-2">
+                    <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
+                    <span>
+                      Transcribing {textDictationLang === 'ml' ? 'Malayalam speech into Malayalam script' : 'English speech into English text'}...
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-400 font-mono hidden sm:inline">Verbatim • Not sent yet</span>
+                </div>
+              ) : (
+                /* NORMAL TEXT INPUT COMPOSER WITH DICTATION MICROPHONE */
+                <form onSubmit={handleSendMessage} className="flex items-center gap-2">
+                  <div className="relative flex-1 flex items-center">
+                    <input
+                      ref={textInputRef}
+                      type="text"
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      onSelect={(e) => {
+                        cursorPositionRef.current = (e.target as HTMLInputElement).selectionStart;
+                      }}
+                      placeholder={
+                        textDictationLang === 'ml'
+                          ? 'മലയാളത്തിൽ ടൈപ്പ് ചെയ്യുക അല്ലെങ്കിൽ മൈക്രോഫോൺ ടാപ്പുചെയ്യുക...'
+                          : 'Type or tap mic to dictate in English...'
+                      }
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-4 pr-11 py-3 text-sm sm:text-base text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500"
+                    />
+
+                    {/* Microphone Dictation Button inside the input */}
+                    <div className="absolute right-2 flex items-center">
+                      <button
+                        type="button"
+                        onClick={() => startRecording('text')}
+                        disabled={isRecording || isTranslating || isStartingRecording}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-amber-400 hover:bg-slate-800/80 transition-all active:scale-95 cursor-pointer disabled:opacity-40"
+                        title={
+                          isStartingRecording && recordingTarget === 'text'
+                            ? 'Starting microphone...'
+                            : `Dictate in ${textDictationLang === 'ml' ? 'Malayalam (മലയാളം)' : 'English'}`
+                        }
+                        aria-label="Dictate message"
+                      >
+                        {isStartingRecording && recordingTarget === 'text' ? (
+                          <RefreshCw className="w-5 h-5 text-amber-400 animate-spin" />
+                        ) : (
+                          <Mic className="w-5 h-5 text-amber-400" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={!inputText.trim() || isTranslating}
+                    className="bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-bold p-3 sm:px-5 sm:py-3 rounded-xl transition-all flex items-center gap-2 shadow-lg shrink-0 cursor-pointer active:scale-95"
+                    title="Send message"
+                  >
+                    <Send className="w-5 h-5" />
+                    <span className="hidden sm:inline">Send</span>
+                  </button>
+                </form>
+              )}
             </div>
           )}
 
-          {/* MODE 2: PUSH-TO-TALK VOICE */}
+          {/* MODE 2: REVIEW-BEFORE-TRANSLATION DICTATION & VOICE */}
           {mode === 'voice' && (
-            <div className="flex flex-col items-center justify-center py-2 space-y-3">
-              <div className="flex items-center justify-center">
+            <div className="flex flex-col space-y-4 py-2">
+              {/* Recording Controls Card */}
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 sm:p-5 flex flex-col items-center text-center space-y-4">
+                
+                {/* 1. SPEECH-INPUT LANGUAGE SELECTOR */}
+                <div className="w-full max-w-md bg-slate-950/90 border border-slate-700/80 rounded-xl p-3 flex flex-col space-y-2 text-left">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-slate-300 flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
+                      <Languages className="w-3.5 h-3.5 text-amber-400" />
+                      Speech-Input Language:
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Destination: <span className="text-amber-300 font-bold">{dictationLang === 'ml' ? 'English' : 'Malayalam'}</span>
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDictationLang('ml')}
+                      disabled={isRecording || isTranscribing}
+                      className={`p-2.5 rounded-lg text-left transition-all flex flex-col ${
+                        dictationLang === 'ml'
+                          ? 'bg-amber-500/20 border-2 border-amber-500 text-amber-200 shadow-md ring-2 ring-amber-500/20'
+                          : 'bg-slate-900 border border-slate-700/80 text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-xs sm:text-sm text-white">മലയാളം (Malayalam)</span>
+                        {dictationLang === 'ml' && <Check className="w-4 h-4 text-amber-400" />}
+                      </div>
+                      <span className="text-[10px] text-slate-400 mt-0.5">Produces Malayalam Script</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setDictationLang('en')}
+                      disabled={isRecording || isTranscribing}
+                      className={`p-2.5 rounded-lg text-left transition-all flex flex-col ${
+                        dictationLang === 'en'
+                          ? 'bg-amber-500/20 border-2 border-amber-500 text-amber-200 shadow-md ring-2 ring-amber-500/20'
+                          : 'bg-slate-900 border border-slate-700/80 text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-xs sm:text-sm text-white">English</span>
+                        {dictationLang === 'en' && <Check className="w-4 h-4 text-amber-400" />}
+                      </div>
+                      <span className="text-[10px] text-slate-400 mt-0.5">Produces English Text</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Primary Recording Buttons */}
+                <div className="flex flex-wrap items-center justify-center gap-3 w-full">
+                  {!isRecording ? (
+                    <button
+                      type="button"
+                      onClick={startRecording}
+                      disabled={isTranscribing || isStartingRecording}
+                      className="px-6 py-3.5 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-bold text-sm sm:text-base flex items-center gap-2.5 shadow-xl transition-all active:scale-95 cursor-pointer"
+                    >
+                      {isStartingRecording && recordingTarget === 'voice' ? (
+                        <>
+                          <RefreshCw className="w-5 h-5 text-slate-950 animate-spin" />
+                          Starting Microphone...
+                        </>
+                      ) : (
+                        <>
+                          <Mic className="w-5 h-5 text-slate-950" />
+                          Start Recording ({dictationLang === 'ml' ? 'Malayalam' : 'English'})
+                        </>
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={stopRecording}
+                      className="px-6 py-3.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-sm sm:text-base flex items-center gap-2.5 shadow-xl ring-4 ring-rose-500/30 animate-pulse transition-all active:scale-95 cursor-pointer"
+                    >
+                      <MicOff className="w-5 h-5" />
+                      Stop Recording ({recordingDuration}s)
+                    </button>
+                  )}
+
+                  {/* Push-to-Hold Alternative */}
+                  {!isRecording && (
+                    <button
+                      type="button"
+                      onMouseDown={startRecording}
+                      onMouseUp={stopRecording}
+                      onTouchStart={(e) => {
+                        e.preventDefault();
+                        startRecording();
+                      }}
+                      onTouchEnd={(e) => {
+                        e.preventDefault();
+                        stopRecording();
+                      }}
+                      disabled={isTranscribing || isStartingRecording}
+                      className="px-4 py-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 border border-slate-700 text-slate-300 font-semibold text-xs sm:text-sm flex items-center gap-2 transition-all select-none"
+                      title="Hold to record, release to transcribe"
+                    >
+                      <Radio className="w-4 h-4 text-amber-400" />
+                      Hold-to-Record
+                    </button>
+                  )}
+                </div>
+
+                {/* Live Acoustic Audio Level Meter during Recording */}
+                {isRecording && (
+                  <div className="w-full max-w-md bg-slate-950/80 border border-slate-700/80 rounded-xl p-3 space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-300 font-medium flex items-center gap-1.5">
+                        <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                        Microphone Acoustic Sound Level:
+                      </span>
+                      <span className={`font-mono font-bold ${micAudioLevel > 10 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                        {micAudioLevel}%
+                      </span>
+                    </div>
+                    <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full transition-all duration-100 ${
+                          micAudioLevel > 40
+                            ? 'bg-emerald-500'
+                            : micAudioLevel > 15
+                            ? 'bg-amber-500'
+                            : 'bg-slate-600'
+                        }`}
+                        style={{ width: `${micAudioLevel}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      {micAudioLevel > 8
+                        ? `Sound detected through phone microphone (Listening for ${dictationLang === 'ml' ? 'Malayalam' : 'English'}).`
+                        : 'Low audio level. If Gurudev is speaking via phone loudspeaker, hold mic closer or raise speaker volume.'}
+                    </p>
+                  </div>
+                )}
+
+                {/* Transcribing State */}
+                {isTranscribing && (
+                  <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs sm:text-sm font-medium">
+                    <RefreshCw className="w-4 h-4 animate-spin text-amber-400" />
+                    Transcribing {dictationLang === 'ml' ? 'Malayalam speech into Malayalam script' : 'English speech into English text'} with Gemini...
+                  </div>
+                )}
+
+                <p className="text-xs text-slate-400 max-w-lg">
+                  Captures voice acoustically through your phone’s microphone while Google Meet is active. The verbatim transcript appears in the review box below for your correction before anything is translated or sent.
+                </p>
+              </div>
+
+              {/* REVIEW-BEFORE-TRANSLATION DRAFT CARD */}
+              {draftTranscript && (
+                <div className="bg-slate-900 border-2 border-amber-500/60 rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3 animate-in fade-in duration-200">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                    <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
+                      <Edit3 className="w-4 h-4 text-amber-400" />
+                      <span>Review & Correct Transcript Before Translating</span>
+                    </div>
+                    <span className="text-[11px] font-semibold uppercase px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                      {draftSourceLang === 'ml' ? 'Malayalam Script' : 'English Text'} • Not Sent Yet
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-slate-400">
+                    {draftSourceLang === 'ml' ? (
+                      <>
+                        Verify Gurudev’s Malayalam words and correct any spelling or sacred spiritual terms (<span className="text-amber-300 font-medium">Gurudev, Sadhana, Diksha, Guruthva, Moksha</span>). Nothing is sent or translated until you click Approve.
+                      </>
+                    ) : (
+                      <>
+                        Verify the English transcript and make any corrections. When approved, it will be translated faithfully into natural Malayalam script with Roman transliteration.
+                      </>
+                    )}
+                  </p>
+
+                  <div className="relative">
+                    <textarea
+                      value={draftTranscript}
+                      onChange={(e) => setDraftTranscript(e.target.value)}
+                      rows={4}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 sm:p-4 text-base sm:text-lg text-white font-sans focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 leading-relaxed"
+                      placeholder={
+                        draftSourceLang === 'ml'
+                          ? 'Edit Malayalam transcript here (മലയാളത്തിൽ തിരുത്തുക)...'
+                          : 'Edit English transcript here...'
+                      }
+                    />
+                  </div>
+
+                  {/* Transcription Timing & Latency Metrics */}
+                  {transcriptionMetrics && (
+                    <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs space-y-2">
+                      <div className="flex items-center justify-between text-slate-400">
+                        <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5 text-amber-400" />
+                          Voice Pipeline Timing Breakdown
+                        </span>
+                        <span className="text-[11px] font-mono text-emerald-400 font-bold bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
+                          Total Latency: {transcriptionMetrics.totalLatencyMs} ms
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-[11px]">
+                        <div className="bg-slate-900/90 rounded-lg p-2 border border-slate-800/80">
+                          <div className="text-slate-400">1. Speech Duration</div>
+                          <div className="font-semibold text-white mt-0.5">{transcriptionMetrics.recordingDurationSec}s</div>
+                          <div className="text-[9px] text-slate-400">User speaking time</div>
+                        </div>
+                        <div className="bg-slate-900/90 rounded-lg p-2 border border-slate-800/80">
+                          <div className="text-slate-400">2. Stop → Upload</div>
+                          <div className="font-semibold text-white mt-0.5">{transcriptionMetrics.stopToUploadMs} ms</div>
+                          <div className="text-[9px] text-slate-400">Client prep & network dispatch</div>
+                        </div>
+                        <div className="bg-slate-900/90 rounded-lg p-2 border border-slate-800/80">
+                          <div className="text-slate-400">3. Gemini Processing</div>
+                          <div className="font-semibold text-amber-300 mt-0.5">{transcriptionMetrics.geminiProcessingMs} ms</div>
+                          <div className="text-[9px] text-slate-400">{transcriptionMetrics.modelUsed}</div>
+                        </div>
+                        <div className="bg-slate-900/90 rounded-lg p-2 border border-slate-800/80">
+                          <div className="text-slate-400">4. Processing Latency</div>
+                          <div className="font-semibold text-emerald-400 mt-0.5">{transcriptionMetrics.totalLatencyMs} ms</div>
+                          <div className="text-[9px] text-slate-400">Stop click to editable text</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Draft Actions */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <button
+                      type="button"
+                      onClick={handleDiscardDraft}
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-all border border-slate-700"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-slate-400" />
+                      Discard Transcript
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleApproveAndTranslate}
+                      disabled={!draftTranscript.trim() || isTranslating}
+                      className="px-6 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-slate-950 font-bold text-sm flex items-center gap-2 shadow-lg transition-all active:scale-95 cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-slate-950" />
+                      Approve & Translate to {draftSourceLang === 'ml' ? 'English' : 'Malayalam'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* MICROPHONE & GOOGLE MEET ACOUSTIC DIAGNOSTIC CARD */}
+              <div className="bg-slate-900/60 border border-slate-800 rounded-xl overflow-hidden">
                 <button
                   type="button"
-                  onMouseDown={startRecording}
-                  onMouseUp={stopRecording}
-                  onTouchStart={(e) => {
-                    e.preventDefault();
-                    startRecording();
-                  }}
-                  onTouchEnd={(e) => {
-                    e.preventDefault();
-                    stopRecording();
-                  }}
-                  className={`w-20 h-20 sm:w-24 sm:h-24 rounded-full flex flex-col items-center justify-center transition-all select-none shadow-2xl ${
-                    isRecording
-                      ? 'bg-rose-600 text-white scale-110 ring-8 ring-rose-500/30 animate-pulse'
-                      : 'bg-amber-500 hover:bg-amber-600 text-slate-950 active:scale-95'
-                  }`}
+                  onClick={() => setShowMicDiagnostic(!showMicDiagnostic)}
+                  className="w-full px-4 py-3 flex items-center justify-between text-left text-xs font-semibold text-slate-300 hover:bg-slate-800/60 transition-all"
                 >
-                  {isRecording ? <MicOff className="w-8 h-8" /> : <Mic className="w-8 h-8" />}
-                  <span className="text-[10px] font-bold uppercase tracking-wider mt-1">
-                    {isRecording ? `${recordingDuration}s` : 'Hold to Speak'}
+                  <span className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-amber-400" />
+                    Microphone & Google Meet Acoustic Diagnostic
                   </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      {isTestingMic ? 'Live Test Active' : 'Check Android Mic Access'}
+                    </span>
+                    {showMicDiagnostic ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  </div>
                 </button>
+
+                {showMicDiagnostic && (
+                  <div className="p-4 border-t border-slate-800/80 bg-slate-950/60 space-y-3.5 text-xs">
+                    <p className="text-slate-300 leading-relaxed">
+                      This diagnostic tests whether Android Chrome can open the microphone while Google Meet is active and measures real-time acoustic input from your phone’s loudspeaker.
+                    </p>
+
+                    {/* Diagnostic Actions & Status */}
+                    <div className="flex flex-wrap items-center gap-3">
+                      {!isTestingMic ? (
+                        <button
+                          type="button"
+                          onClick={runMicDiagnostic}
+                          className="px-3.5 py-2 rounded-lg bg-amber-500 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow"
+                        >
+                          <Activity className="w-3.5 h-3.5" />
+                          Start Microphone Test
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={stopMicDiagnostic}
+                          className="px-3.5 py-2 rounded-lg bg-rose-600 text-white font-bold text-xs flex items-center gap-1.5 shadow"
+                        >
+                          <MicOff className="w-3.5 h-3.5" />
+                          Stop Microphone Test
+                        </button>
+                      )}
+
+                      <span className="text-slate-400">
+                        Permission: <span className="text-white font-mono font-semibold capitalize">{micPermissionStatus}</span>
+                      </span>
+                    </div>
+
+                    {/* Live Audio Level Progress Bar */}
+                    {isTestingMic && (
+                      <div className="space-y-1.5 bg-slate-900 border border-slate-800 rounded-lg p-3">
+                        <div className="flex justify-between items-center text-xs">
+                          <span className="text-slate-300 font-medium">Acoustic Sound Level Gauge:</span>
+                          <span className={`font-mono font-bold ${diagnosticAudioLevel > 10 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                            {diagnosticAudioLevel}% RMS
+                          </span>
+                        </div>
+                        <div className="w-full bg-slate-800 h-3 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full transition-all duration-75 ${
+                              diagnosticAudioLevel > 40
+                                ? 'bg-emerald-500'
+                                : diagnosticAudioLevel > 15
+                                ? 'bg-amber-500'
+                                : 'bg-slate-600'
+                            }`}
+                            style={{ width: `${diagnosticAudioLevel}%` }}
+                          />
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          {diagnosticAudioLevel > 12
+                            ? '✅ Sound waves detected by microphone!'
+                            : diagnosticAudioLevel > 0
+                            ? '⚠️ Low audio level. Bring microphone closer to speaker.'
+                            : '❌ 0% RMS. If Gurudev is speaking and the meter stays at 0%, Android AEC is filtering phone loudspeaker audio.'}
+                        </p>
+                      </div>
+                    )}
+
+                    {diagnosticError && (
+                      <div className="p-3 rounded-lg bg-rose-500/15 border border-rose-500/30 text-rose-200 text-xs flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-bold">Microphone Error</div>
+                          <div>{diagnosticError}</div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Technical Guidance Box */}
+                    <div className="p-3.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400 space-y-2">
+                      <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+                        <Info className="w-3.5 h-3.5 text-amber-400" />
+                        Google Meet App & Android Compatibility Notes:
+                      </div>
+                      <ul className="list-disc list-inside space-y-1.5 text-slate-400">
+                        <li>
+                          <strong className="text-slate-300">No Muting Required in Meet:</strong> You do NOT need to mute or unmute yourself in the Google Meet app as part of this workflow.
+                        </li>
+                        <li>
+                          <strong className="text-slate-300">Android Simultaneous Mic Access:</strong> Android puts active calls into <code className="text-amber-300 font-mono">VOICE_COMMUNICATION</code> mode. Some Android devices support concurrent recording in Chrome, while other device vendors restrict the microphone to one app at a time. The gauge above immediately tests whether your specific Android phone allows concurrent access.
+                        </li>
+                        <li>
+                          <strong className="text-slate-300">Loudspeaker Acoustic Cancellation (AEC):</strong> Phone hardware actively filters out sound emitted by its own internal loudspeaker to prevent feedback in Meet. If the gauge remains near 0% while Gurudev speaks, hold the phone near an external speaker or use a secondary device.
+                        </li>
+                      </ul>
+                    </div>
+                  </div>
+                )}
               </div>
-              <p className="text-xs text-slate-400 text-center">
-                {isRecording
-                  ? `Recording in ${userRole === 'malayalam_speaker' ? 'Malayalam' : 'English'}... Release to translate.`
-                  : `Hold the button to speak in ${userRole === 'malayalam_speaker' ? 'Malayalam' : 'English'}, release to send.`}
-              </p>
             </div>
           )}
 

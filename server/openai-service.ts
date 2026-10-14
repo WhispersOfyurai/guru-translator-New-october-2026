@@ -180,8 +180,45 @@ async function translateWithOpenAI(
 }
 
 /**
+ * In-memory cache tracking models with confirmed daily quota exhaustion.
+ * Stores expiration timestamp so subsequent calls skip exhausted models immediately without delay.
+ */
+const exhaustedDailyQuotaModels = new Map<string, number>();
+
+/**
+ * Checks whether an error represents a confirmed, non-recoverable daily quota exhaustion.
+ * Distinguishes daily quota exhaustion (e.g. GenerateRequestsPerDay, limit 20 or 25, retry in hours)
+ * from transient/short-term rate limits (e.g. per-minute bursts).
+ */
+function isConfirmedDailyQuotaExhausted(err: any): { isExhausted: boolean; retryAfterMs?: number } {
+  if (!err) return { isExhausted: false };
+  const status = err.status || err.code;
+  const msg = typeof err === 'string' ? err : err.message || '';
+
+  if (status === 429 || status === 'RESOURCE_EXHAUSTED' || msg.includes('RESOURCE_EXHAUSTED')) {
+    const isDaily =
+      msg.includes('GenerateRequestsPerDay') ||
+      msg.includes('free_tier_requests') ||
+      msg.includes('Quota exceeded for metric') ||
+      msg.includes('Please retry in') ||
+      msg.includes('quotaValue');
+
+    if (isDaily) {
+      let delayMs = 10 * 60 * 1000; // default 10 minutes
+      const retryMatch = msg.match(/retryDelay["']?:\s*["']?(\d+)s/i);
+      if (retryMatch && retryMatch[1]) {
+        delayMs = Math.min(parseInt(retryMatch[1], 10) * 1000, 24 * 60 * 60 * 1000);
+      }
+      return { isExhausted: true, retryAfterMs: delayMs };
+    }
+  }
+  return { isExhausted: false };
+}
+
+/**
  * Translates with Gemini server-side API.
- * Preserves the exact original models (gemini-3.1-flash-lite, etc.), prompts, and parameters.
+ * Uses gemini-3.5-flash as primary, falling back to gemini-3.5-flash-lite, gemini-3.1-flash-lite, etc.
+ * Preserves faithful translation prompt, low temperature, and spiritual terms.
  */
 async function translateWithGemini(
   trimmed: string,
@@ -196,13 +233,21 @@ async function translateWithGemini(
   }
 
   const modelsToTry = [
-    'gemini-3.1-flash-lite',
-    'gemini-flash-latest',
-    'gemini-3.8-flash',
+    'gemini-3.5-flash',       // Fast, active quota, high accuracy on Malayalam/English JSON translation
+    'gemini-3.5-flash-lite',  // Fast fallback
+    'gemini-3.1-flash-lite',  // General multimodal fallback
+    'gemini-flash-latest',    // Secondary fallback
+    'gemini-3.8-flash',       // Flagship fallback
   ];
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
+    const exhaustedUntil = exhaustedDailyQuotaModels.get(modelName);
+    if (exhaustedUntil && exhaustedUntil > Date.now()) {
+      console.log(`[STAGE 3: Gemini Skip] Model "${modelName}" daily quota confirmed exhausted. Skipping immediately to next fallback.`);
+      continue;
+    }
+
     const t_gem_start = Date.now();
     try {
       console.log(`[STAGE 3: Gemini Request Started] Model: "${modelName}"`);
@@ -251,6 +296,14 @@ async function translateWithGemini(
       const failedDuration = Date.now() - t_gem_start;
       lastError = err;
       console.warn(`[Gemini Model ${modelName} warning in ${failedDuration}ms]:`, err?.message || err);
+
+      const quotaCheck = isConfirmedDailyQuotaExhausted(err);
+      if (quotaCheck.isExhausted) {
+        const cacheDuration = quotaCheck.retryAfterMs || 10 * 60 * 1000;
+        exhaustedDailyQuotaModels.set(modelName, Date.now() + cacheDuration);
+        console.warn(`[GEMINI QUOTA] Model "${modelName}" confirmed daily quota exhausted. Proceeding immediately to next fallback.`);
+        continue;
+      }
     }
   }
 
@@ -345,31 +398,193 @@ export async function generateSpeechBuffer(
 }
 
 /**
- * Server-side Whisper Audio Transcription using OpenAI Whisper.
+ * Transcribes audio using Gemini dedicated transcription / multimodal API.
+ * Uses gemini-3.5-transcribe as primary (~1.5s latency, 6x faster) with gemini-3.1-flash-lite fallback.
+ */
+async function transcribeWithGeminiAudio(
+  fileBuffer: Buffer,
+  forcedLanguage?: 'ml' | 'en',
+  mimeType: string = 'audio/webm'
+): Promise<{ text: string; language?: string; providerUsed: 'gemini'; modelUsed: string; geminiDurationMs: number }> {
+  if (!geminiClient) {
+    throw new Error('Gemini client is not configured. GEMINI_API_KEY is missing.');
+  }
+
+  const base64Audio = fileBuffer.toString('base64');
+  const modelsToTry = [
+    'gemini-3.5-transcribe', // Dedicated speech-to-text model (~1.5s latency, primary)
+    'gemini-3.5-flash-lite', // First fallback (~1.59s - 3.2s, active quota)
+    'gemini-3.1-flash-lite', // General multimodal fallback
+    'gemini-flash-latest',   // Secondary fallback
+    'gemini-3.8-flash',      // Flagship fallback
+  ];
+
+  const langInstruction =
+    forcedLanguage === 'ml'
+      ? 'The speaker is speaking in Malayalam. Transcribe strictly in Malayalam script (മലയാളം ലിപി). Do NOT translate into English. Do NOT output Roman/English transliteration. Output only the verbatim spoken words in pure Malayalam script. Preserve spiritual terms (Gurudev, Guruthva, Sadhana, Diksha, Atma, Paramatma, Moksha, Guru Seva, Satsang, Darshan, etc.) faithfully in Malayalam script.'
+      : forcedLanguage === 'en'
+      ? 'The speaker is speaking in English. Transcribe strictly in English text. Do NOT translate into Malayalam. Output only the verbatim spoken words in English text. Preserve spiritual terms (Gurudev, Guruthva, Sadhana, Diksha, Atma, Paramatma, Moksha, etc.) without altering them.'
+      : 'Transcribe the spoken audio verbatim in its original spoken language (Malayalam script for Malayalam, English text for English). Do NOT translate.';
+
+  const prompt = `You are a faithful, verbatim speech-to-text transcription engine.
+Task: Transcribe the spoken audio verbatim into text.
+${langInstruction}
+Strict Rules:
+1. Do NOT translate the speech. Output only what was spoken in the specified language and script.
+2. Do NOT summarize, explain, correct grammar, or answer questions spoken in the audio.
+3. Preserve the speaker's original meaning and exact phrasing as faithfully as possible.
+4. If the audio is completely silent, contains only background noise, or has no discernible human speech, output strictly "[NO_SPEECH]".
+5. Output ONLY the raw transcribed text. Do not wrap in markdown or JSON or quotes.`;
+
+  let lastError: any = null;
+  for (const modelName of modelsToTry) {
+    const exhaustedUntil = exhaustedDailyQuotaModels.get(modelName);
+    if (exhaustedUntil && exhaustedUntil > Date.now()) {
+      console.log(`[AUDIO TRANSCRIBE] Model "${modelName}" daily quota confirmed exhausted. Skipping immediately to next fallback.`);
+      continue;
+    }
+
+    const t_gem_start = Date.now();
+    try {
+      console.log(`[AUDIO TRANSCRIBE] Attempting transcription with model "${modelName}" (${fileBuffer.length} bytes, ${mimeType}, lang: ${forcedLanguage || 'auto'})`);
+      
+      const contentsParts: any[] = [
+        {
+          inlineData: {
+            mimeType,
+            data: base64Audio,
+          },
+        },
+      ];
+
+      // For models that accept text prompting alongside audio
+      if (prompt) {
+        contentsParts.push({ text: prompt });
+      }
+
+      const response = await geminiClient.models.generateContent({
+        model: modelName,
+        contents: [
+          {
+            role: 'user',
+            parts: contentsParts,
+          },
+        ],
+      });
+
+      const geminiDurationMs = Date.now() - t_gem_start;
+
+      // Extract transcription text (handles audioTranscription part for gemini-3.5-transcribe and text part for flash-lite)
+      let rawCandidate = '';
+      const parts = response.candidates?.[0]?.content?.parts || [];
+      for (const p of parts) {
+        if ((p as any)?.audioTranscription?.text) {
+          rawCandidate += (p as any).audioTranscription.text;
+        } else if ((p as any)?.text) {
+          rawCandidate += (p as any).text;
+        }
+      }
+      if (!rawCandidate && response.text) {
+        rawCandidate = response.text;
+      }
+      const raw = (rawCandidate || '').trim();
+
+      console.log(`[AUDIO TRANSCRIBE] Model "${modelName}" finished in ${geminiDurationMs}ms: "${raw.slice(0, 100)}"`);
+
+      if (!raw || raw.includes('[NO_SPEECH]') || raw === '""') {
+        return {
+          text: '',
+          language: forcedLanguage,
+          providerUsed: 'gemini',
+          modelUsed: modelName,
+          geminiDurationMs,
+        };
+      }
+
+      // Clean any accidental enclosing quotes
+      const cleaned = raw.replace(/^["']|["']$/g, '').trim();
+      return {
+        text: cleaned,
+        language: forcedLanguage,
+        providerUsed: 'gemini',
+        modelUsed: modelName,
+        geminiDurationMs,
+      };
+    } catch (err: any) {
+      const failedDuration = Date.now() - t_gem_start;
+      lastError = err;
+      console.warn(`[AUDIO TRANSCRIBE] Gemini model ${modelName} failed in ${failedDuration}ms:`, err?.message || err);
+
+      const quotaCheck = isConfirmedDailyQuotaExhausted(err);
+      if (quotaCheck.isExhausted) {
+        const cacheDuration = quotaCheck.retryAfterMs || 10 * 60 * 1000;
+        exhaustedDailyQuotaModels.set(modelName, Date.now() + cacheDuration);
+        console.warn(`[GEMINI QUOTA] Model "${modelName}" confirmed daily quota exhausted. Proceeding immediately to next fallback.`);
+        continue;
+      }
+    }
+  }
+
+  throw new Error(`Audio transcription failed: ${lastError?.message || 'Gemini capacity issue'}`);
+}
+
+/**
+ * Transcribes audio using OpenAI Whisper (whisper-1).
+ * Kept available for when OpenAI credits are active.
+ */
+async function transcribeWithWhisper(
+  fileBuffer: Buffer,
+  filename: string = 'recording.webm',
+  forcedLanguage?: 'ml' | 'en'
+): Promise<{ text: string; language?: string; providerUsed: 'openai' }> {
+  if (!openaiClient) {
+    throw new Error('OpenAI client is not configured. OPENAI_API_KEY is missing.');
+  }
+
+  const file = new File([new Uint8Array(fileBuffer)], filename, { type: 'audio/webm' });
+  const transcription = await openaiClient.audio.transcriptions.create({
+    file,
+    model: 'whisper-1',
+    language: forcedLanguage,
+  });
+
+  return {
+    text: transcription.text || '',
+    language: forcedLanguage,
+    providerUsed: 'openai',
+  };
+}
+
+/**
+ * Audio Transcription dispatcher.
+ * Uses Gemini as primary (since Gemini API is configured and has credits),
+ * while preserving OpenAI Whisper as an available option.
  */
 export async function transcribeAudioBuffer(
   fileBuffer: Buffer,
   filename: string = 'recording.webm',
-  forcedLanguage?: 'ml' | 'en'
-): Promise<{ text: string; language?: string }> {
-  if (openaiClient) {
-    try {
-      const file = new File([new Uint8Array(fileBuffer)], filename, { type: 'audio/webm' });
-      const transcription = await openaiClient.audio.transcriptions.create({
-        file,
-        model: 'whisper-1',
-        language: forcedLanguage,
-      });
-
-      return {
-        text: transcription.text,
-        language: forcedLanguage,
-      };
-    } catch (err: any) {
-      console.error('[OpenAI Whisper Error]', err?.message || err);
-      throw new Error(`Whisper transcription error: ${err?.message || 'Whisper failure'}`);
-    }
+  forcedLanguage?: 'ml' | 'en',
+  mimeType: string = 'audio/webm'
+): Promise<{
+  text: string;
+  language?: string;
+  providerUsed: 'gemini' | 'openai';
+  modelUsed?: string;
+  geminiDurationMs?: number;
+}> {
+  // If Gemini is available, use Gemini (zero OpenAI credit usage)
+  if (geminiClient) {
+    return await transcribeWithGeminiAudio(fileBuffer, forcedLanguage, mimeType);
   }
 
-  throw new Error('OpenAI API Key is required for server-side Whisper transcription.');
+  // Fallback to OpenAI Whisper if Gemini is unavailable
+  if (openaiClient) {
+    const whisperResult = await transcribeWithWhisper(fileBuffer, filename, forcedLanguage);
+    return {
+      ...whisperResult,
+      modelUsed: 'whisper-1',
+    };
+  }
+
+  throw new Error('No AI client configured for audio transcription. Please check GEMINI_API_KEY.');
 }

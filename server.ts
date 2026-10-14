@@ -25,6 +25,9 @@ async function startServer() {
   // Parse JSON payloads up to 10MB (for voice messages)
   app.use(express.json({ limit: '10mb' }));
 
+  // Parse raw audio payloads up to 25MB (for fast binary audio transcription upload without base64 overhead)
+  app.use(express.raw({ type: ['audio/*', 'application/octet-stream'], limit: '25mb' }));
+
   // WebSocket Server for Realtime Room Communication
   const wss = new WebSocketServer({ noServer: true });
 
@@ -235,17 +238,50 @@ async function startServer() {
     }
   });
 
-  // Push-to-Talk Whisper Audio Transcription Endpoint
+  // Audio Transcription Endpoint (Gemini primary / Whisper preserved)
+  // Supports both direct binary streams (fastest, no base64 overhead) and JSON base64 payloads
   app.post('/api/transcribe', async (req, res) => {
+    const tServerReceived = Date.now();
     try {
-      const { audioBase64, language } = req.body;
-      if (!audioBase64) {
-        return res.status(400).json({ error: 'audioBase64 data is required' });
+      let buffer: Buffer;
+      let language: 'ml' | 'en' | undefined;
+      let cleanMime: string;
+
+      if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+        // Direct binary stream from client
+        buffer = req.body;
+        const queryLang = (req.query.language || req.query.lang || req.headers['x-language']) as string;
+        language = queryLang === 'ml' ? 'ml' : queryLang === 'en' ? 'en' : undefined;
+        cleanMime = (req.headers['content-type'] || 'audio/webm').split(';')[0].trim();
+      } else if (req.body && typeof req.body === 'object') {
+        // JSON payload containing base64 audio
+        const { audioBase64, language: lang, mimeType } = req.body;
+        if (!audioBase64) {
+          return res.status(400).json({ error: 'Audio data is required (binary stream or audioBase64)' });
+        }
+        const commaIdx = audioBase64.indexOf(',');
+        const rawBase64 = commaIdx !== -1 ? audioBase64.slice(commaIdx + 1) : audioBase64;
+        buffer = Buffer.from(rawBase64, 'base64');
+        language = lang === 'ml' ? 'ml' : lang === 'en' ? 'en' : undefined;
+        cleanMime = (mimeType || 'audio/webm').split(';')[0].trim();
+      } else {
+        return res.status(400).json({ error: 'No audio data received' });
       }
 
-      const buffer = Buffer.from(audioBase64.replace(/^data:audio\/\w+;base64,/, ''), 'base64');
-      const result = await transcribeAudioBuffer(buffer, 'audio.webm', language);
-      return res.json(result);
+      const result = await transcribeAudioBuffer(buffer, 'audio.webm', language, cleanMime);
+      const tServerComplete = Date.now();
+      const serverDurationMs = tServerComplete - tServerReceived;
+
+      return res.json({
+        ...result,
+        timings: {
+          serverReceived: tServerReceived,
+          serverComplete: tServerComplete,
+          geminiDurationMs: result.geminiDurationMs || serverDurationMs,
+          serverDurationMs,
+          modelUsed: result.modelUsed || 'gemini-3.5-transcribe',
+        },
+      });
     } catch (err: any) {
       console.error('[API /api/transcribe Error]', err);
       return res.status(500).json({
