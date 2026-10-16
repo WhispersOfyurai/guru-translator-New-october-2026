@@ -186,14 +186,25 @@ async function translateWithOpenAI(
 const exhaustedDailyQuotaModels = new Map<string, number>();
 
 /**
- * Checks whether an error represents a confirmed, non-recoverable daily quota exhaustion.
- * Distinguishes daily quota exhaustion (e.g. GenerateRequestsPerDay, limit 20 or 25, retry in hours)
- * from transient/short-term rate limits (e.g. per-minute bursts).
+ * Checks whether an error represents a confirmed daily quota exhaustion or transient 503 capacity spike.
+ * Distinguishes daily quota exhaustion (GenerateRequestsPerDay) from transient spikes (503 UNAVAILABLE / high demand).
  */
-function isConfirmedDailyQuotaExhausted(err: any): { isExhausted: boolean; retryAfterMs?: number } {
+function isConfirmedDailyQuotaExhausted(err: any): { isExhausted: boolean; retryAfterMs?: number; isTransientSpike?: boolean } {
   if (!err) return { isExhausted: false };
   const status = err.status || err.code;
   const msg = typeof err === 'string' ? err : err.message || '';
+
+  // 503 Service Unavailable / Spikes in demand / Timeouts
+  if (
+    status === 503 ||
+    msg.includes('503') ||
+    msg.includes('high demand') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout')
+  ) {
+    return { isExhausted: true, retryAfterMs: 60 * 1000, isTransientSpike: true };
+  }
 
   if (status === 429 || status === 'RESOURCE_EXHAUSTED' || msg.includes('RESOURCE_EXHAUSTED')) {
     const isDaily =
@@ -462,7 +473,7 @@ Strict Rules:
         contentsParts.push({ text: prompt });
       }
 
-      const response = await geminiClient.models.generateContent({
+      const apiCallPromise = geminiClient.models.generateContent({
         model: modelName,
         contents: [
           {
@@ -471,6 +482,15 @@ Strict Rules:
           },
         ],
       });
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`503 Model "${modelName}" timed out after 12000ms (demand spike)`)),
+          12000
+        )
+      );
+
+      const response = await Promise.race([apiCallPromise, timeoutPromise]);
 
       const geminiDurationMs = Date.now() - t_gem_start;
 
@@ -519,9 +539,9 @@ Strict Rules:
       if (quotaCheck.isExhausted) {
         const cacheDuration = quotaCheck.retryAfterMs || 10 * 60 * 1000;
         exhaustedDailyQuotaModels.set(modelName, Date.now() + cacheDuration);
-        console.warn(`[GEMINI QUOTA] Model "${modelName}" confirmed daily quota exhausted. Proceeding immediately to next fallback.`);
-        continue;
+        console.warn(`[GEMINI ${quotaCheck.isTransientSpike ? '503 SPIKE' : 'QUOTA'}] Model "${modelName}" temporarily unavailable (${Math.round(cacheDuration / 1000)}s). Proceeding immediately to next fallback.`);
       }
+      continue;
     }
   }
 

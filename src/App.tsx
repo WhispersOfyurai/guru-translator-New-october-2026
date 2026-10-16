@@ -87,6 +87,12 @@ export default function App() {
   });
   const setUserRole = (role: UserRole) => {
     setUserRoleState(role);
+    const newLang = role === 'english_speaker' ? 'en' : 'ml';
+    setDictationLang(newLang);
+    dictationLangRef.current = newLang;
+    recordingLangRef.current = newLang;
+    setTextDictationLang(newLang);
+    textDictationLangRef.current = newLang;
     try {
       localStorage.setItem(STORAGE_USER_ROLE, role);
     } catch (_) {}
@@ -143,6 +149,7 @@ export default function App() {
 
   // Review-Before-Translation Dictation State
   const [draftTranscript, setDraftTranscript] = useState<string>('');
+  const [isDraftActive, setIsDraftActive] = useState<boolean>(false);
   const [isTranscribing, setIsTranscribing] = useState<boolean>(false);
   const [dictationLang, setDictationLang] = useState<'ml' | 'en'>(() => (userRole === 'english_speaker' ? 'en' : 'ml'));
   const [draftSourceLang, setDraftSourceLang] = useState<'ml' | 'en'>('ml');
@@ -168,6 +175,27 @@ export default function App() {
   const [recordingTarget, setRecordingTarget] = useState<'text' | 'voice' | null>(null);
   const [isStartingRecording, setIsStartingRecording] = useState<boolean>(false);
 
+  // Language Synchronous Refs (guarantees accurate language on first recording without closure staleness)
+  const dictationLangRef = useRef<'ml' | 'en'>(userRole === 'english_speaker' ? 'en' : 'ml');
+  dictationLangRef.current = dictationLang;
+  const textDictationLangRef = useRef<'ml' | 'en'>(userRole === 'english_speaker' ? 'en' : 'ml');
+  textDictationLangRef.current = textDictationLang;
+  const recordingLangRef = useRef<'ml' | 'en'>(userRole === 'english_speaker' ? 'en' : 'ml');
+
+  const handleSetDictationLang = (lang: 'ml' | 'en') => {
+    setDictationLang(lang);
+    dictationLangRef.current = lang;
+    recordingLangRef.current = lang;
+    console.log(`[Language Select] Push-to-Talk dictation language set to: ${lang}`);
+  };
+
+  const handleSetTextDictationLang = (lang: 'ml' | 'en') => {
+    setTextDictationLang(lang);
+    textDictationLangRef.current = lang;
+    recordingLangRef.current = lang;
+    console.log(`[Language Select] Text Mode dictation language set to: ${lang}`);
+  };
+
   // Refs
   const recordingTargetRef = useRef<'text' | 'voice' | null>(null);
   const isCancelledRef = useRef<boolean>(false);
@@ -176,6 +204,7 @@ export default function App() {
   const stopRequestedRef = useRef<boolean>(false);
   const recordedMimeTypeRef = useRef<string>('audio/webm');
   const textInputRef = useRef<HTMLInputElement | null>(null);
+  const draftTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const cursorPositionRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -589,6 +618,7 @@ export default function App() {
     setConnectionStatus('disconnected');
     setMessages([]);
     setDraftTranscript('');
+    setIsDraftActive(false);
     window.history.pushState({}, '', `/`);
   };
 
@@ -661,6 +691,10 @@ export default function App() {
     }
 
     const target: 'text' | 'voice' = targetOrEvent === 'text' ? 'text' : 'voice';
+    const activeLang = target === 'text' ? textDictationLangRef.current : dictationLangRef.current;
+    recordingLangRef.current = activeLang;
+    console.log(`[Microphone] startRecording initiated: target=${target}, activeLang=${activeLang}`);
+
     setErrorMessage(null);
     isCancelledRef.current = false;
     stopRequestedRef.current = false;
@@ -671,6 +705,7 @@ export default function App() {
 
     if (target === 'voice') {
       setDraftTranscript('');
+      setIsDraftActive(false);
       setTranscriptionMetrics(null);
     } else if (target === 'text') {
       if (textInputRef.current) {
@@ -811,7 +846,12 @@ export default function App() {
         }
 
         try {
-          const speechInputLang = currentTarget === 'text' ? textDictationLang : dictationLang;
+          const speechInputLang =
+            recordingLangRef.current ||
+            (currentTarget === 'text' ? textDictationLangRef.current : dictationLangRef.current);
+          console.log(
+            `[Microphone] onstop uploading: target=${currentTarget}, speechInputLang=${speechInputLang}, blobSize=${audioBlob.size}, mime=${recordedMimeTypeRef.current}`
+          );
           // Direct binary stream upload: cuts client base64 overhead and reduces payload by ~33%
           const transcribeRes = await fetch(`/api/transcribe?language=${speechInputLang}`, {
             method: 'POST',
@@ -867,8 +907,17 @@ export default function App() {
                 modelUsed: data.modelUsed || data.timings?.modelUsed || 'gemini-3.5-transcribe',
               });
               setDraftTranscript(transcribedText);
+              setIsDraftActive(true);
               setDraftSourceLang(speechInputLang);
               setErrorMessage(null);
+              // Focus the draft textarea for direct keyboard editing
+              setTimeout(() => {
+                if (draftTextareaRef.current) {
+                  draftTextareaRef.current.focus();
+                  const len = draftTextareaRef.current.value.length;
+                  draftTextareaRef.current.setSelectionRange(len, len);
+                }
+              }, 80);
             }
           } else {
             setErrorMessage(
@@ -988,7 +1037,8 @@ export default function App() {
 
   // Submit approved, corrected transcript through the faithful translation pipeline
   const handleApproveAndTranslate = () => {
-    if (!draftTranscript.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    const textToTranslate = draftTranscript.trim();
+    if (!textToTranslate || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
     const t1 = Date.now();
     const sourceLang = draftSourceLang;
@@ -1004,7 +1054,7 @@ export default function App() {
           senderId: userId,
           senderName: userName || (sourceLang === 'ml' ? 'Malayalam Speaker' : 'English Speaker'),
           senderRole: sourceLang === 'ml' ? 'malayalam_speaker' : 'english_speaker',
-          text: draftTranscript.trim(),
+          text: textToTranslate,
           sourceLang,
           messageType: 'voice',
           clientTimings: {
@@ -1017,13 +1067,35 @@ export default function App() {
 
     // Clear draft transcript once dispatched
     setDraftTranscript('');
+    setIsDraftActive(false);
     setTranscriptionMetrics(null);
   };
 
   const handleDiscardDraft = () => {
     setDraftTranscript('');
+    setIsDraftActive(false);
     setTranscriptionMetrics(null);
     setErrorMessage(null);
+  };
+
+  // Helper to insert sacred spiritual terms into the draft transcript at cursor position
+  const handleInsertDraftTerm = (term: string) => {
+    if (!draftTextareaRef.current) {
+      setDraftTranscript((prev) => (prev ? `${prev} ${term}` : term));
+      return;
+    }
+    const textarea = draftTextareaRef.current;
+    const start = textarea.selectionStart ?? draftTranscript.length;
+    const end = textarea.selectionEnd ?? draftTranscript.length;
+    const before = draftTranscript.slice(0, start).trimEnd();
+    const after = draftTranscript.slice(end).trimStart();
+    const newText = [before, term, after].filter(Boolean).join(' ');
+    setDraftTranscript(newText);
+    setTimeout(() => {
+      textarea.focus();
+      const newCursor = before ? before.length + 1 + term.length : term.length;
+      textarea.setSelectionRange(newCursor, newCursor);
+    }, 40);
   };
 
   // =========================================================================
@@ -1786,7 +1858,7 @@ export default function App() {
                   <span className="text-slate-400 text-[11px] px-1 hidden sm:inline font-medium">Dictate:</span>
                   <button
                     type="button"
-                    onClick={() => setTextDictationLang('ml')}
+                    onClick={() => handleSetTextDictationLang('ml')}
                     disabled={isRecording || isTranscribing}
                     className={`px-2 py-0.5 rounded-lg transition-all text-[11px] font-semibold cursor-pointer ${
                       textDictationLang === 'ml'
@@ -1799,7 +1871,7 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setTextDictationLang('en')}
+                    onClick={() => handleSetTextDictationLang('en')}
                     disabled={isRecording || isTranscribing}
                     className={`px-2 py-0.5 rounded-lg transition-all text-[11px] font-semibold cursor-pointer ${
                       textDictationLang === 'en'
@@ -1973,7 +2045,7 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      onClick={() => setDictationLang('ml')}
+                      onClick={() => handleSetDictationLang('ml')}
                       disabled={isRecording || isTranscribing}
                       className={`p-2.5 rounded-lg text-left transition-all flex flex-col ${
                         dictationLang === 'ml'
@@ -1990,7 +2062,7 @@ export default function App() {
 
                     <button
                       type="button"
-                      onClick={() => setDictationLang('en')}
+                      onClick={() => handleSetDictationLang('en')}
                       disabled={isRecording || isTranscribing}
                       className={`p-2.5 rounded-lg text-left transition-all flex flex-col ${
                         dictationLang === 'en'
@@ -2012,7 +2084,7 @@ export default function App() {
                   {!isRecording ? (
                     <button
                       type="button"
-                      onClick={startRecording}
+                      onClick={() => startRecording('voice')}
                       disabled={isTranscribing || isStartingRecording}
                       className="px-6 py-3.5 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-bold text-sm sm:text-base flex items-center gap-2.5 shadow-xl transition-all active:scale-95 cursor-pointer"
                     >
@@ -2043,11 +2115,11 @@ export default function App() {
                   {!isRecording && (
                     <button
                       type="button"
-                      onMouseDown={startRecording}
+                      onMouseDown={() => startRecording('voice')}
                       onMouseUp={stopRecording}
                       onTouchStart={(e) => {
                         e.preventDefault();
-                        startRecording();
+                        startRecording('voice');
                       }}
                       onTouchEnd={(e) => {
                         e.preventDefault();
@@ -2109,7 +2181,7 @@ export default function App() {
               </div>
 
               {/* REVIEW-BEFORE-TRANSLATION DRAFT CARD */}
-              {draftTranscript && (
+              {isDraftActive && (
                 <div className="bg-slate-900 border-2 border-amber-500/60 rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3 animate-in fade-in duration-200">
                   <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
                     <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
@@ -2121,30 +2193,71 @@ export default function App() {
                     </span>
                   </div>
 
-                  <p className="text-xs text-slate-400">
+                  <p className="text-xs text-slate-400 leading-relaxed">
                     {draftSourceLang === 'ml' ? (
                       <>
-                        Verify Gurudev’s Malayalam words and correct any spelling or sacred spiritual terms (<span className="text-amber-300 font-medium">Gurudev, Sadhana, Diksha, Guruthva, Moksha</span>). Nothing is sent or translated until you click Approve.
+                        Verify Gurudev’s Malayalam words and correct any spelling, punctuation, or sacred spiritual terms using your device keyboard. Nothing is sent or translated until you tap Approve.
                       </>
                     ) : (
                       <>
-                        Verify the English transcript and make any corrections. When approved, it will be translated faithfully into natural Malayalam script with Roman transliteration.
+                        Verify the English transcript and make any corrections directly below using your device keyboard. When approved, it will be translated faithfully into natural Malayalam script with Roman transliteration.
                       </>
                     )}
                   </p>
 
+                  {/* Quick sacred spiritual terminology insertion chips */}
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px] text-slate-400 scrollbar-none">
+                    <span className="shrink-0 text-slate-500 font-medium">Quick terms:</span>
+                    {(draftSourceLang === 'ml'
+                      ? ['ഗുരുദേവ്', 'സാധന', 'ഗുരുത്വം', 'ദീക്ഷ', 'ആത്മാവ്', 'മോക്ഷം', 'സത്സംഗം']
+                      : ['Gurudev', 'Sadhana', 'Guruthva', 'Diksha', 'Atma', 'Moksha', 'Satsang']
+                    ).map((term) => (
+                      <button
+                        key={term}
+                        type="button"
+                        onClick={() => handleInsertDraftTerm(term)}
+                        className="shrink-0 px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700/80 transition-all font-mono text-xs cursor-pointer active:scale-95"
+                        title={`Insert ${term} into draft`}
+                      >
+                        +{term}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Fully Editable Text Area */}
                   <div className="relative">
                     <textarea
+                      ref={draftTextareaRef}
                       value={draftTranscript}
                       onChange={(e) => setDraftTranscript(e.target.value)}
                       rows={4}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 sm:p-4 text-base sm:text-lg text-white font-sans focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 leading-relaxed"
+                      dir="auto"
+                      autoComplete="off"
+                      autoCorrect="on"
+                      spellCheck={true}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 sm:p-4 text-base sm:text-lg text-white font-sans focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500 leading-relaxed resize-y selection:bg-amber-500/30"
                       placeholder={
                         draftSourceLang === 'ml'
                           ? 'Edit Malayalam transcript here (മലയാളത്തിൽ തിരുത്തുക)...'
                           : 'Edit English transcript here...'
                       }
                     />
+                    <div className="flex items-center justify-between mt-1 px-1 text-[11px] text-slate-500">
+                      <span>
+                        {draftTranscript.trim() ? (
+                          <span className="text-emerald-400/90 font-medium">
+                            ✓ Ready for translation ({draftTranscript.trim().split(/\s+/).filter(Boolean).length} words • {draftTranscript.length} chars)
+                          </span>
+                        ) : (
+                          <span className="text-amber-400/90">
+                            Type or paste your text above, or record again
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-mono text-slate-400">
+                        Language: {draftSourceLang === 'ml' ? 'Malayalam' : 'English'}
+                      </span>
+                    </div>
                   </div>
 
                   {/* Transcription Timing & Latency Metrics */}
@@ -2189,7 +2302,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleDiscardDraft}
-                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-all border border-slate-700"
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-all border border-slate-700 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5 text-slate-400" />
                       Discard Transcript
